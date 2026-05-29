@@ -8,6 +8,18 @@ use alloy::{
 };
 use serde::{Deserialize, Serialize};
 
+/// User-facing access list entry. Address and storage keys are kept as strings
+/// so they can contain `{placeholder}` references that are resolved when the
+/// loose definition is converted to its strict form.
+#[derive(Clone, Deserialize, Debug, Serialize)]
+pub struct LooseAccessListItem {
+    /// Address of the contract. May be a `{placeholder}`.
+    pub address: String,
+    /// Storage keys to prewarm. Each may be a `{placeholder}`.
+    #[serde(rename = "storageKeys")]
+    pub storage_keys: Vec<String>,
+}
+
 /// User-facing definition of a function call to be executed.
 #[derive(Clone, Deserialize, Debug, Serialize)]
 pub struct FunctionCallDefinition {
@@ -44,8 +56,10 @@ pub struct FunctionCallDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authorization_address: Option<String>,
     /// Optional EIP-2930 access list entries to include in the transaction.
+    /// Address and storage keys may contain `{placeholder}` references that are
+    /// resolved when the loose definition is converted to its strict form.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub access_list: Option<Vec<AccessListItem>>,
+    pub access_list: Option<Vec<LooseAccessListItem>>,
     /// If true and `from_pool` is set, run this setup transaction for all accounts in the pool.
     /// Defaults to false (only runs for the first account).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -123,7 +137,7 @@ impl FunctionCallDefinition {
         self.authorization_address = Some(auth_addr.as_ref().to_owned());
         self
     }
-    pub fn with_access_list(mut self, access_list: Vec<AccessListItem>) -> Self {
+    pub fn with_access_list(mut self, access_list: Vec<LooseAccessListItem>) -> Self {
         self.access_list = Some(access_list);
         self
     }
@@ -255,5 +269,27 @@ mod tests {
             "0x4200000000000000000000000000000000000022"
         );
         assert_eq!(access_list[0].storage_keys.len(), 2);
+    }
+
+    #[test]
+    fn access_list_parses_placeholders_from_toml() {
+        let toml = r#"
+            to = "0x1234567890123456789012345678901234567890"
+            from_pool = "test_pool"
+            signature = "test()"
+
+            [[access_list]]
+            address = "{SpamMe5}"
+            storageKeys = ["{testkey1}", "{testkey2}"]
+        "#;
+        let def: FunctionCallDefinition = toml::from_str(toml).unwrap();
+        let access_list = def.access_list.unwrap();
+
+        assert_eq!(access_list.len(), 1);
+        assert_eq!(access_list[0].address, "{SpamMe5}");
+        assert_eq!(
+            access_list[0].storage_keys,
+            vec!["{testkey1}".to_string(), "{testkey2}".to_string()]
+        );
     }
 }

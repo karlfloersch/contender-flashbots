@@ -105,7 +105,7 @@ where
 
     /// Finds {placeholders} in `fncall` and looks them up in `db`,
     /// then inserts the values it finds into `placeholder_map`.
-    /// NOTE: only finds placeholders in `args`, `authorization_addr`, and `to` fields.
+    /// NOTE: scans `args`, `from`, `to`, `authorization_address`, and `access_list` fields.
     fn find_fncall_placeholders(
         &self,
         fncall: &FunctionCallDefinition,
@@ -154,6 +154,28 @@ where
                 genesis_hash,
                 scenario_label,
             )?;
+        }
+        if let Some(access_list) = &fncall.access_list {
+            for item in access_list.iter() {
+                self.find_placeholder_values(
+                    &item.address,
+                    placeholder_map,
+                    db,
+                    rpc_url,
+                    genesis_hash,
+                    scenario_label,
+                )?;
+                for key in &item.storage_keys {
+                    self.find_placeholder_values(
+                        key,
+                        placeholder_map,
+                        db,
+                        rpc_url,
+                        genesis_hash,
+                        scenario_label,
+                    )?;
+                }
+            }
         }
         Ok(())
     }

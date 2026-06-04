@@ -17,9 +17,9 @@ use crate::{
 use alloy::{
     eips::eip7702::SignedAuthorization,
     hex::ToHexExt,
-    primitives::{keccak256, Address, FixedBytes, U256},
+    primitives::{keccak256, Address, FixedBytes, B256, U256},
     providers::Provider,
-    rpc::types::Authorization,
+    rpc::types::{AccessListItem, Authorization},
     signers::{local::PrivateKeySigner, SignerSync},
 };
 use async_trait::async_trait;
@@ -316,6 +316,43 @@ where
             None
         };
 
+        // Resolve {placeholders} in the optional access list, then parse each
+        // entry into alloy's strict `AccessListItem` type.
+        let access_list = if let Some(loose_list) = &funcdef.access_list {
+            let mut placeholder_map = HashMap::<K, String>::new();
+            let templater = self.get_templater();
+            templater.find_fncall_placeholders(
+                funcdef,
+                self.get_db(),
+                &mut placeholder_map,
+                &self.get_rpc_url(),
+                self.get_genesis_hash(),
+                self.get_scenario_label(),
+            )?;
+            let mut items = Vec::with_capacity(loose_list.len());
+            for item in loose_list.iter() {
+                let resolved_addr = templater.replace_placeholders(&item.address, &placeholder_map);
+                let address = resolved_addr
+                    .parse::<Address>()
+                    .map_err(|_| GeneratorError::address_not_found(&item.address))?;
+                let mut storage_keys = Vec::with_capacity(item.storage_keys.len());
+                for key in &item.storage_keys {
+                    let resolved_key = templater.replace_placeholders(key, &placeholder_map);
+                    let parsed = resolved_key
+                        .parse::<B256>()
+                        .map_err(|_| GeneratorError::address_not_found(key))?;
+                    storage_keys.push(parsed);
+                }
+                items.push(AccessListItem {
+                    address,
+                    storage_keys,
+                });
+            }
+            Some(items)
+        } else {
+            None
+        };
+
         Ok(FunctionCallDefinitionStrict {
             to: to_address,
             from: from_address,
@@ -325,9 +362,10 @@ where
             fuzz: funcdef.fuzz.to_owned().unwrap_or_default(),
             kind: funcdef.kind.to_owned(),
             gas_limit: funcdef.gas_limit.to_owned(),
+            max_priority_fee_per_gas: funcdef.max_priority_fee_per_gas.to_owned(),
             sidecar: funcdef.sidecar_data()?,
             authorization: signed_auth.map(|a| vec![a]),
-            access_list: funcdef.access_list.to_owned(),
+            access_list,
         })
     }
 
@@ -564,6 +602,8 @@ where
                         let prepare_tx = |req| {
                             let mut args = get_fuzzed_args(req, &canonical_fuzz_map, i)?;
                             let fuzz_tx_value = get_fuzzed_tx_value(req, &canonical_fuzz_map, i)?;
+                            let fuzz_priority_fee =
+                                get_fuzzed_max_priority_fee_per_gas(req, &canonical_fuzz_map, i)?;
                             // Special handling for WorldID proof generation
                             if req
                                 .kind
@@ -593,6 +633,9 @@ where
 
                             if fuzz_tx_value.is_some() {
                                 req.value = fuzz_tx_value;
+                            }
+                            if fuzz_priority_fee.is_some() {
+                                req.max_priority_fee_per_gas = fuzz_priority_fee;
                             }
 
                             let tx = NamedTxRequest::new(
@@ -712,22 +755,53 @@ fn get_fuzzed_tx_value(
     Ok(None)
 }
 
+/// If a `FuzzParam` with `max_priority_fee_per_gas = true` is present,
+/// return the fuzzed wei value (as a decimal string) for `fuzz_idx`.
+fn get_fuzzed_max_priority_fee_per_gas(
+    tx: &FunctionCallDefinition,
+    fuzz_map: &HashMap<String, Vec<U256>>,
+    fuzz_idx: usize,
+) -> Result<Option<String>> {
+    if let Some(fuzz) = &tx.fuzz {
+        for fuzz_param in fuzz {
+            if fuzz_param.max_priority_fee_per_gas == Some(true) {
+                let values = fuzz_map
+                    .get(MAX_PRIORITY_FEE_KEY)
+                    .ok_or(GeneratorError::ValueFuzzerNotInitialized)?;
+                return Ok(Some(values[fuzz_idx].to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn parse_map_key(fuzz: FuzzParam) -> Result<String> {
-    if fuzz.param.is_none() && fuzz.value.is_none() {
+    // exactly one of `param`, `value`, or `max_priority_fee_per_gas` must be set
+    let set_count = [
+        fuzz.param.is_some(),
+        fuzz.value.is_some(),
+        fuzz.max_priority_fee_per_gas.is_some(),
+    ]
+    .iter()
+    .filter(|&&b| b)
+    .count();
+    if set_count == 0 {
         return Err(GeneratorError::FuzzMissingParams);
     }
-    if fuzz.param.is_some() && fuzz.value.is_some() {
+    if set_count > 1 {
         return Err(GeneratorError::FuzzConflictingParams);
     }
 
-    let key = match (fuzz.param.as_ref(), fuzz.value) {
-        (Some(param), _) => param.to_owned(),
-        (None, Some(true)) => VALUE_KEY.to_owned(),
-        (None, Some(false)) => return Err(GeneratorError::FuzzValueNeedsParam),
-        _ => return Err(GeneratorError::FuzzInvalid),
-    };
-
-    Ok(key)
+    if let Some(param) = fuzz.param {
+        return Ok(param);
+    }
+    match (fuzz.value, fuzz.max_priority_fee_per_gas) {
+        (Some(true), _) => Ok(VALUE_KEY.to_owned()),
+        (Some(false), _) => Err(GeneratorError::FuzzValueNeedsParam),
+        (_, Some(true)) => Ok(MAX_PRIORITY_FEE_KEY.to_owned()),
+        (_, Some(false)) => Err(GeneratorError::FuzzValueNeedsParam),
+        _ => Err(GeneratorError::FuzzInvalid),
+    }
 }
 
 pub fn sign_auth(signer: &PrivateKeySigner, auth: Authorization) -> Result<SignedAuthorization> {
@@ -735,4 +809,70 @@ pub fn sign_auth(signer: &PrivateKeySigner, auth: Authorization) -> Result<Signe
         .sign_hash_sync(&auth.signature_hash())
         .map_err(UtilError::Signer)?;
     Ok(auth.into_signed(auth_sig))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fuzz_param() -> FuzzParam {
+        FuzzParam {
+            param: None,
+            value: None,
+            max_priority_fee_per_gas: None,
+            min: None,
+            max: None,
+        }
+    }
+
+    #[test]
+    fn parse_map_key_routes_param_by_name() {
+        let mut p = fuzz_param();
+        p.param = Some("guy".to_string());
+        assert_eq!(parse_map_key(p).unwrap(), "guy");
+    }
+
+    #[test]
+    fn parse_map_key_routes_value_to_value_key() {
+        let mut p = fuzz_param();
+        p.value = Some(true);
+        assert_eq!(parse_map_key(p).unwrap(), VALUE_KEY);
+    }
+
+    #[test]
+    fn parse_map_key_routes_priority_fee_flag_to_priority_fee_key() {
+        let mut p = fuzz_param();
+        p.max_priority_fee_per_gas = Some(true);
+        assert_eq!(parse_map_key(p).unwrap(), MAX_PRIORITY_FEE_KEY);
+    }
+
+    #[test]
+    fn parse_map_key_rejects_param_and_priority_fee() {
+        let mut p = fuzz_param();
+        p.param = Some("x".to_string());
+        p.max_priority_fee_per_gas = Some(true);
+        assert!(matches!(
+            parse_map_key(p),
+            Err(GeneratorError::FuzzConflictingParams)
+        ));
+    }
+
+    #[test]
+    fn parse_map_key_rejects_value_and_priority_fee() {
+        let mut p = fuzz_param();
+        p.value = Some(true);
+        p.max_priority_fee_per_gas = Some(true);
+        assert!(matches!(
+            parse_map_key(p),
+            Err(GeneratorError::FuzzConflictingParams)
+        ));
+    }
+
+    #[test]
+    fn parse_map_key_rejects_empty() {
+        assert!(matches!(
+            parse_map_key(fuzz_param()),
+            Err(GeneratorError::FuzzMissingParams)
+        ));
+    }
 }
